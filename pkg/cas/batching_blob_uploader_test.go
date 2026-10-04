@@ -11,7 +11,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/chunk"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/testutil"
-	"github.com/buildbarn/bb-storage/pkg/zstd"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 	"golang.org/x/sync/semaphore"
@@ -27,18 +26,37 @@ func TestBatchingBlobUploadSuccess(t *testing.T) {
 	cdcParametersFetcher := mock.NewMockCDCParametersFetcher(ctrl)
 	uploadConcurrencySemaphore := semaphore.NewWeighted(10)
 
-	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, zstd.NewUnboundedPool(nil, nil), 2, uploadConcurrencySemaphore)
+	digestEmpty := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "d41d8cd98f00b204e9800998ecf8427e", 0)
+	digestFunction := digestEmpty.GetDigestFunction()
+	digestHello := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
+	digestGoodbye := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "6fc422233a40a75a1f028e11c3cd1140", 7)
+	putReader := mock.NewMockPutReaderFunc(ctrl)
+	putReader.EXPECT().Call(gomock.Any(), digestHello, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, d digest.Digest, r io.Reader) error {
+			data, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, []byte("Hello"), data)
+			return nil
+		},
+	)
+	putReader.EXPECT().Call(gomock.Any(), digestGoodbye, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, d digest.Digest, r io.Reader) error {
+			data, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, []byte("Goodbye"), data)
+			return nil
+		},
+	)
+
+	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, 2, uploadConcurrencySemaphore, putReader.Call)
 
 	// We should be able to enqueue requests for up to two blobs
 	// without generating any calls on the storage backend.
-	digestEmpty := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "d41d8cd98f00b204e9800998ecf8427e", 0)
-	digestFunction := digestEmpty.GetDigestFunction()
 	for i := 0; i < 10; i++ {
 		d, err := blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader(nil))
 		require.NoError(t, err)
 		require.Equal(t, digestEmpty, d)
 	}
-	digestHello := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
 	for i := 0; i < 10; i++ {
 		d, err := blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader([]byte("Hello")))
 		require.NoError(t, err)
@@ -58,15 +76,7 @@ func TestBatchingBlobUploadSuccess(t *testing.T) {
 	chunkMappingStorage.EXPECT().
 		FindMissing(gomock.Any(), digest.EmptySet).
 		Return(digest.EmptySet, nil)
-	chunkStorage.EXPECT().Put(gomock.Any(), digestHello, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, digest digest.Digest, data *chunk.Chunk) error {
-			chunkData := data.GetBytes()
-			require.Equal(t, []byte("Hello"), chunkData)
-			return nil
-		},
-	)
 
-	digestGoodbye := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "6fc422233a40a75a1f028e11c3cd1140", 7)
 	d, err := blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader([]byte("Goodbye")))
 	require.NoError(t, err)
 	require.Equal(t, digestGoodbye, d)
@@ -82,13 +92,6 @@ func TestBatchingBlobUploadSuccess(t *testing.T) {
 	chunkMappingStorage.EXPECT().
 		FindMissing(gomock.Any(), digest.EmptySet).
 		Return(digest.EmptySet, nil)
-	chunkStorage.EXPECT().Put(gomock.Any(), digestGoodbye, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, digest digest.Digest, data *chunk.Chunk) error {
-			chunkData := data.GetBytes()
-			require.Equal(t, []byte("Goodbye"), chunkData)
-			return nil
-		},
-	)
 
 	require.NoError(t, flush(ctx))
 	// Redundant flushing should cause no operations.
@@ -102,7 +105,17 @@ func TestBatchingBlobUploaderFailure(t *testing.T) {
 	chunkMappingStorage := mock.NewMockBlobAccess[chunk.Mapping](ctrl)
 	cdcParametersFetcher := mock.NewMockCDCParametersFetcher(ctrl)
 	uploadConcurrencySemaphore := semaphore.NewWeighted(1)
-	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, zstd.NewUnboundedPool(nil, nil), 2, uploadConcurrencySemaphore)
+	digestHello := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
+	putReader := mock.NewMockPutReaderFunc(ctrl)
+	putReader.EXPECT().Call(gomock.Any(), digestHello, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, d digest.Digest, r io.Reader) error {
+			data, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, []byte("Hello"), data)
+			return status.Error(codes.Internal, "Storage backend on fire")
+		},
+	)
+	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, 2, uploadConcurrencySemaphore, putReader.Call)
 
 	// We should be able to enqueue requests for up to two blobs
 	// without generating any calls on the storage backend.
@@ -113,7 +126,6 @@ func TestBatchingBlobUploaderFailure(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, digestEmpty, d)
 	}
-	digestHello := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
 	for i := 0; i < 10; i++ {
 		d, err := blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader([]byte("Hello")))
 		require.NoError(t, err)
@@ -133,19 +145,12 @@ func TestBatchingBlobUploaderFailure(t *testing.T) {
 	chunkMappingStorage.EXPECT().
 		FindMissing(gomock.Any(), digest.EmptySet).
 		Return(digest.EmptySet, nil)
-	chunkStorage.EXPECT().Put(gomock.Any(), digestHello, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, digest digest.Digest, data *chunk.Chunk) error {
-			chunkData := data.GetBytes()
-			require.Equal(t, []byte("Hello"), chunkData)
-			return status.Error(codes.Internal, "Storage backend on fire")
-		},
-	)
 
 	digestGoodbye := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "6fc422233a40a75a1f028e11c3cd1140", 7)
 	_, err := blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader([]byte("Goodbye")))
 	testutil.RequireEqualStatus(
 		t,
-		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Failed to save chunk: Storage backend on fire"),
+		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Storage backend on fire"),
 		err,
 	)
 
@@ -154,7 +159,7 @@ func TestBatchingBlobUploaderFailure(t *testing.T) {
 	_, err = blobUploader.UploadBlob(ctx, digestFunction, cas.ByteSliceFileReader([]byte("Goodbye")))
 	testutil.RequireEqualStatus(
 		t,
-		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Failed to save chunk: Storage backend on fire"),
+		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Storage backend on fire"),
 		err,
 	)
 
@@ -163,7 +168,7 @@ func TestBatchingBlobUploaderFailure(t *testing.T) {
 	// caused it to go into the error state.
 	testutil.RequireEqualStatus(
 		t,
-		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Failed to save chunk: Storage backend on fire"),
+		status.Error(codes.Internal, "Failed to store previous blob 3-8b1a9953c4611296a827abf8c47804d7-5-default: Storage backend on fire"),
 		flush(ctx),
 	)
 
@@ -187,7 +192,8 @@ func TestBatchingBlobUploaderCanceledWhileWaitingOnSemaphore(t *testing.T) {
 	chunkMappingStorage := mock.NewMockBlobAccess[chunk.Mapping](ctrl)
 	cdcParametersFetcher := mock.NewMockCDCParametersFetcher(ctrl)
 	uploadConcurrencySemaphore := semaphore.NewWeighted(0)
-	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, zstd.NewUnboundedPool(nil, nil), 2, uploadConcurrencySemaphore)
+	putReader := mock.NewMockPutReaderFunc(ctrl)
+	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, 2, uploadConcurrencySemaphore, putReader.Call)
 
 	// Enqueue a blob for writing.
 	digestHello := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
@@ -224,14 +230,25 @@ func TestBatchingBlobUploaderSuccessFileGrownDuringUpload(t *testing.T) {
 	chunkMappingStorage := mock.NewMockBlobAccess[chunk.Mapping](ctrl)
 	cdcParametersFetcher := mock.NewMockCDCParametersFetcher(ctrl)
 	uploadConcurrencySemaphore := semaphore.NewWeighted(1)
-	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, zstd.NewUnboundedPool(nil, nil), 2, uploadConcurrencySemaphore)
-
 	helloWorldDigest := digest.MustNewDigest("default", remoteexecution.DigestFunction_MD5, "3e25960a79dbc69b674cd4ec67a72c62", 11)
+	putReader := mock.NewMockPutReaderFunc(ctrl)
+	putReader.EXPECT().Call(gomock.Any(), helloWorldDigest, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, d digest.Digest, r io.Reader) error {
+			data, err := io.ReadAll(r)
+			require.NoError(t, err)
+			require.Equal(t, []byte("Hello world"), data)
+			return nil
+		},
+	)
+	blobUploader, flush := cas.NewBatchingBlobUploader(chunkStorage, chunkMappingStorage, cdcParametersFetcher, digest.KeyWithoutInstance, 2, uploadConcurrencySemaphore, putReader.Call)
+
 	digestFunction := helloWorldDigest.GetDigestFunction()
 
 	file := mock.NewMockFileReader(ctrl)
 	gomock.InOrder(
 		file.EXPECT().Len().Return(int64(11), nil),
+		// First read during UploadBlob to compute the digest of
+		// the blob.
 		file.EXPECT().ReadAt(gomock.Any(), int64(0)).DoAndReturn(
 			func(p []byte, off int64) (int, error) {
 				require.Len(t, p, 11)
@@ -239,6 +256,10 @@ func TestBatchingBlobUploaderSuccessFileGrownDuringUpload(t *testing.T) {
 				return 11, io.EOF
 			},
 		),
+		// Second read by the put reader, which is handed a section
+		// limited to the size of the blob, so growing the file
+		// during the upload does not affect the data that is
+		// stored.
 		file.EXPECT().ReadAt(gomock.Any(), int64(0)).DoAndReturn(
 			func(p []byte, off int64) (int, error) {
 				require.Len(t, p, 11)
@@ -263,13 +284,6 @@ func TestBatchingBlobUploaderSuccessFileGrownDuringUpload(t *testing.T) {
 	chunkMappingStorage.EXPECT().
 		FindMissing(gomock.Any(), digest.EmptySet).
 		Return(digest.EmptySet, nil)
-	chunkStorage.EXPECT().Put(gomock.Any(), helloWorldDigest, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, digest digest.Digest, data *chunk.Chunk) error {
-			chunkData := data.GetBytes()
-			require.Equal(t, []byte("Hello world"), chunkData)
-			return nil
-		},
-	)
 
 	require.NoError(t, flush(ctx))
 }

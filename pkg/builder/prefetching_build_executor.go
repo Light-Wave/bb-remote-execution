@@ -19,7 +19,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/filesystem/path"
 	"github.com/buildbarn/bb-storage/pkg/proto/fsac"
 	"github.com/buildbarn/bb-storage/pkg/util"
-	"github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -42,9 +41,7 @@ type prefetchingBuildExecutor struct {
 	bloomFilterMaximumSizeBytes int
 	logFileSystemAccessProfile  bool
 	emptyProfile                *fsac.FileSystemAccessProfile
-	zstdPool                    zstd.Pool
-	chunkStorage                blobstore.BlobAccess[*chunk.Chunk]
-	chunkMappingStorage         blobstore.BlobAccess[chunk.Mapping]
+	protoPutter                 re_cas.ProtoPutter
 }
 
 // NewPrefetchingBuildExecutor creates a decorator for BuildExecutor
@@ -63,7 +60,7 @@ type prefetchingBuildExecutor struct {
 // directory (FUSE, NFSv4). On workers that use native build
 // directories, the monitor is ignored, leading to empty Bloom filters
 // being stored.
-func NewPrefetchingBuildExecutor(buildExecutor BuildExecutor, chunkBytesReader reader.Reader[[]byte], chunkMappingFetcher chunk.MappingFetcher, cdcParametersFetcher capabilities.CDCParametersFetcher, directoryFetcher re_cas.DirectoryFetcher, fileReadSemaphore *semaphore.Weighted, fileSystemAccessCache blobstore.BlobAccess[*fsac.FileSystemAccessProfile], maximumMessageSizeBytes, bloomFilterBitsPerElement, bloomFilterMaximumSizeBytes int, logFileSystemAccessProfile bool, zstdPool zstd.Pool, chunkStorage blobstore.BlobAccess[*chunk.Chunk], chunkMappingStorage blobstore.BlobAccess[chunk.Mapping]) BuildExecutor {
+func NewPrefetchingBuildExecutor(buildExecutor BuildExecutor, chunkBytesReader reader.Reader[[]byte], chunkMappingFetcher chunk.MappingFetcher, cdcParametersFetcher capabilities.CDCParametersFetcher, directoryFetcher re_cas.DirectoryFetcher, fileReadSemaphore *semaphore.Weighted, fileSystemAccessCache blobstore.BlobAccess[*fsac.FileSystemAccessProfile], maximumMessageSizeBytes, bloomFilterBitsPerElement, bloomFilterMaximumSizeBytes int, logFileSystemAccessProfile bool, protoPutter re_cas.ProtoPutter) BuildExecutor {
 	be := &prefetchingBuildExecutor{
 		BuildExecutor:               buildExecutor,
 		chunkBytesReader:            chunkBytesReader,
@@ -76,9 +73,7 @@ func NewPrefetchingBuildExecutor(buildExecutor BuildExecutor, chunkBytesReader r
 		bloomFilterBitsPerElement:   bloomFilterBitsPerElement,
 		bloomFilterMaximumSizeBytes: bloomFilterMaximumSizeBytes,
 		logFileSystemAccessProfile:  logFileSystemAccessProfile,
-		zstdPool:                    zstdPool,
-		chunkStorage:                chunkStorage,
-		chunkMappingStorage:         chunkMappingStorage,
+		protoPutter:                 protoPutter,
 	}
 	be.emptyProfile = be.computeProfile(access.NewBloomFilterComputingUnreadDirectoryMonitor())
 	return be
@@ -93,16 +88,8 @@ func (be *prefetchingBuildExecutor) computeProfile(monitor *access.BloomFilterCo
 }
 
 func (be *prefetchingBuildExecutor) storeFileSystemAccessProfileToCAS(ctx context.Context, profile *fsac.FileSystemAccessProfile, digestFunction digest.Function) (digest.Digest, error) {
-	params, err := be.cdcParametersFetcher.FetchCDCParameters(ctx, digestFunction.GetInstanceName())
-	if err != nil {
-		return digest.BadDigest, err
-	}
-	return re_cas.PutProto(
+	return be.protoPutter.PutProto(
 		ctx,
-		be.zstdPool,
-		be.chunkStorage,
-		be.chunkMappingStorage,
-		params,
 		profile,
 		digestFunction,
 	)

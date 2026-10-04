@@ -12,11 +12,8 @@ import (
 	"github.com/buildbarn/bb-remote-execution/pkg/proto/remoteworker"
 	re_util "github.com/buildbarn/bb-remote-execution/pkg/util"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
-	"github.com/buildbarn/bb-storage/pkg/blobstore/chunk"
-	"github.com/buildbarn/bb-storage/pkg/capabilities"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/util"
-	"github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -24,12 +21,9 @@ import (
 
 type cachingBuildExecutor struct {
 	BuildExecutor
-	chunkStorage         blobstore.BlobAccess[*chunk.Chunk]
-	chunkMappingStorage  blobstore.BlobAccess[chunk.Mapping]
-	cdcParametersFetcher capabilities.CDCParametersFetcher
-	zstdPool             zstd.Pool
-	actionCache          blobstore.BlobAccess[*remoteexecution.ActionResult]
-	portalURL            *url.URL
+	protoPutter re_cas.ProtoPutter
+	actionCache blobstore.BlobAccess[*remoteexecution.ActionResult]
+	portalURL   *url.URL
 }
 
 // NewCachingBuildExecutor creates an adapter for BuildExecutor that
@@ -39,15 +33,12 @@ type cachingBuildExecutor struct {
 //
 // In both cases, a link to bb-portal is added to the ExecuteResponse,
 // so that the user may inspect the Action and ActionResult in detail.
-func NewCachingBuildExecutor(base BuildExecutor, chunkStorage blobstore.BlobAccess[*chunk.Chunk], chunkMappingStorage blobstore.BlobAccess[chunk.Mapping], cdcParametersFetcher capabilities.CDCParametersFetcher, zstdPool zstd.Pool, actionCache blobstore.BlobAccess[*remoteexecution.ActionResult], portalURL *url.URL) BuildExecutor {
+func NewCachingBuildExecutor(base BuildExecutor, protoPutter re_cas.ProtoPutter, actionCache blobstore.BlobAccess[*remoteexecution.ActionResult], portalURL *url.URL) BuildExecutor {
 	return &cachingBuildExecutor{
-		BuildExecutor:        base,
-		chunkStorage:         chunkStorage,
-		chunkMappingStorage:  chunkMappingStorage,
-		cdcParametersFetcher: cdcParametersFetcher,
-		zstdPool:             zstdPool,
-		actionCache:          actionCache,
-		portalURL:            portalURL,
+		BuildExecutor: base,
+		protoPutter:   protoPutter,
+		actionCache:   actionCache,
+		portalURL:     portalURL,
 	}
 }
 
@@ -68,17 +59,8 @@ func (be *cachingBuildExecutor) Execute(ctx context.Context, filePool pool.FileP
 		// Extension: store the result in the Content
 		// Addressable Storage, so the user can at least inspect
 		// it through bb_portal.
-		params, err := be.cdcParametersFetcher.FetchCDCParameters(ctx, actionDigest.GetInstanceName())
-		if err != nil {
-			attachErrorToExecuteResponse(response, util.StatusWrap(err, "Failed to fetch CDC parameters"))
-			return response
-		}
-		if historicalExecuteResponseDigest, err := re_cas.PutProto(
+		if historicalExecuteResponseDigest, err := be.protoPutter.PutProto(
 			ctx,
-			be.zstdPool,
-			be.chunkStorage,
-			be.chunkMappingStorage,
-			params,
 			&cas_proto.HistoricalExecuteResponse{
 				ActionDigest:    actionDigest.GetProto(),
 				ExecuteResponse: response,

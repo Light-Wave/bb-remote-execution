@@ -14,7 +14,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/filesystem"
 	"github.com/buildbarn/bb-storage/pkg/util"
-	"github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -35,9 +34,9 @@ type batchingBlobUploader struct {
 	chunkStorage               blobstore.BlobAccess[*chunk.Chunk]
 	chunkMappingStorage        blobstore.BlobAccess[chunk.Mapping]
 	cdcParametersFetcher       capabilities.CDCParametersFetcher
-	zstdPool                   zstd.Pool
 	digestKeyFormat            digest.KeyFormat
 	batchSize                  int
+	putReader                  PutReaderFunc
 	uploadConcurrencySemaphore *semaphore.Weighted
 
 	lock                    sync.Mutex
@@ -48,14 +47,14 @@ type batchingBlobUploader struct {
 // NewBatchingBlobUploader returns a BlobUploader that batches uploads
 // to the Content Addressable Storage (CAS) into batches of the
 // specified size while respecting an upload concurrency.
-func NewBatchingBlobUploader(chunkStorage blobstore.BlobAccess[*chunk.Chunk], chunkMappingStorage blobstore.BlobAccess[chunk.Mapping], cdcParametersFetcher capabilities.CDCParametersFetcher, digestKeyFormat digest.KeyFormat, zstdPool zstd.Pool, batchSize int, uploadConcurrencySemaphore *semaphore.Weighted) (BlobUploader, func(context.Context) error) {
+func NewBatchingBlobUploader(chunkStorage blobstore.BlobAccess[*chunk.Chunk], chunkMappingStorage blobstore.BlobAccess[chunk.Mapping], cdcParametersFetcher capabilities.CDCParametersFetcher, digestKeyFormat digest.KeyFormat, batchSize int, uploadConcurrencySemaphore *semaphore.Weighted, putReader PutReaderFunc) (BlobUploader, func(context.Context) error) {
 	bu := &batchingBlobUploader{
 		chunkStorage:               chunkStorage,
 		chunkMappingStorage:        chunkMappingStorage,
 		cdcParametersFetcher:       cdcParametersFetcher,
-		zstdPool:                   zstdPool,
 		digestKeyFormat:            digestKeyFormat,
 		batchSize:                  batchSize,
+		putReader:                  putReader,
 		uploadConcurrencySemaphore: uploadConcurrencySemaphore,
 		pendingUploadOperations:    map[string]pendingUploadOperation{},
 	}
@@ -123,13 +122,12 @@ func (bu *batchingBlobUploader) flushLocked(ctx context.Context) {
 					if err := util.AcquireSemaphore(groupCtx, bu.uploadConcurrencySemaphore, 1); err != nil {
 						return err
 					}
-					params := paramsPerInstance[pending.digest.GetInstanceName()]
 					delete(bu.pendingUploadOperations, key)
 					group.Go(func() error {
 						defer pending.file.Close()
 						// TODO: Use our random access io to do
 						// multithreaded chunking.
-						err := cas.PutReader(groupCtx, bu.zstdPool, bu.chunkStorage, bu.chunkMappingStorage, params, pending.digest, io.NewSectionReader(pending.file, 0, d.GetSizeBytes()))
+						err := bu.putReader(groupCtx, pending.digest, io.NewSectionReader(pending.file, 0, d.GetSizeBytes()))
 						bu.uploadConcurrencySemaphore.Release(1)
 						if err != nil {
 							return util.StatusWrapf(err, "Failed to store previous blob %s", pending.digest)

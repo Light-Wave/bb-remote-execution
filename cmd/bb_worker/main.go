@@ -403,9 +403,14 @@ func main() {
 						localChunkMappingStorage,
 						localCdcParametersFetcher,
 						digestKeyFormat,
-						zstdPool,
 						uploadBatchSize,
 						outputUploadConcurrencySemaphore,
+						re_cas.NewPutReaderFunc(
+							zstdPool,
+							localChunkStorage,
+							localChunkMappingStorage,
+							localCdcParametersFetcher,
+						),
 					)
 
 					// When the virtual file system is
@@ -493,9 +498,12 @@ func main() {
 							int(prefetchingConfiguration.BloomFilterBitsPerPath),
 							int(prefetchingConfiguration.BloomFilterMaximumSizeBytes),
 							prefetchingConfiguration.LogFileSystemAccessProfile,
-							zstdPool,
-							chunkStorage,
-							chunkMappingStorage,
+							re_cas.NewProtoPutter(re_cas.NewPutReaderFunc(
+								zstdPool,
+								chunkStorage,
+								chunkMappingStorage,
+								cdcParametersFetcher,
+							)),
 						)
 					}
 
@@ -526,10 +534,12 @@ func main() {
 
 					buildExecutor = builder.NewCachingBuildExecutor(
 						buildExecutor,
-						chunkStorage,
-						chunkMappingStorage,
-						cdcParametersFetcher,
-						zstdPool,
+						re_cas.NewProtoPutter(re_cas.NewPutReaderFunc(
+							zstdPool,
+							chunkStorage,
+							chunkMappingStorage,
+							cdcParametersFetcher,
+						)),
 						actionCache,
 						portalURL,
 					)

@@ -11,12 +11,9 @@ import (
 	"github.com/buildbarn/bb-remote-execution/pkg/filesystem/pool"
 	"github.com/buildbarn/bb-remote-execution/pkg/proto/remoteworker"
 	"github.com/buildbarn/bb-remote-execution/pkg/proto/resourceusage"
-	"github.com/buildbarn/bb-storage/pkg/blobstore/chunk"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/proto/fsac"
 	"github.com/buildbarn/bb-storage/pkg/testutil"
-	"github.com/buildbarn/bb-storage/pkg/zstd"
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
 
 	"golang.org/x/sync/semaphore"
@@ -37,9 +34,6 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 	directoryFetcher := mock.NewMockDirectoryFetcher(ctrl)
 	fileReadSemaphore := semaphore.NewWeighted(1)
 	fileSystemAccessCache := mock.NewMockBlobAccess[*fsac.FileSystemAccessProfile](ctrl)
-	zstdPool := zstd.NewUnboundedPool(nil, nil)
-	chunkStorage := mock.NewMockBlobAccess[*chunk.Chunk](ctrl)
-	chunkMappingStorage := mock.NewMockBlobAccess[chunk.Mapping](ctrl)
 	buildExecutor := builder.NewPrefetchingBuildExecutor(
 		baseBuildExecutor,
 		chunkBytesReader,
@@ -52,9 +46,7 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 		/* bloomFilterBitsPerElement = */ 10,
 		/* bloomFilterMaximumSizeBytes = */ 1000,
 		/* logFileSystemAccessProfile = */ false,
-		zstdPool,
-		chunkStorage,
-		chunkMappingStorage,
+		mock.NewMockProtoPutter(ctrl),
 	)
 
 	filePool := mock.NewMockFilePool(ctrl)
@@ -498,6 +490,7 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 
 	// The build executor that will be used in the tests below
 	// to test the log file system access profile configuration.
+	protoPutter := mock.NewMockProtoPutter(ctrl)
 	profileLoggingBuildExecutor := builder.NewPrefetchingBuildExecutor(
 		baseBuildExecutor,
 		chunkBytesReader,
@@ -510,9 +503,7 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 		/* bloomFilterBitsPerElement = */ 10,
 		/* bloomFilterMaximumSizeBytes = */ 1000,
 		/* logFileSystemAccessProfile = */ true,
-		zstd.NewUnboundedPool(nil, nil),
-		chunkStorage,
-		chunkMappingStorage,
+		protoPutter,
 	)
 
 	t.Run("CASLogAccessProfileSuccess", func(t *testing.T) {
@@ -538,17 +529,14 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 				BloomFilterHashFunctions: 1,
 			}, nil)
 		accessProfileDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "dc1d3a7d5a534e6175cdc57c96cc031d", 5)
-		chunkStorage.EXPECT().Put(gomock.Any(), accessProfileDigest, gomock.Any()).
-			DoAndReturn(func(ctx context.Context, blobDigest digest.Digest, chunk *chunk.Chunk) error {
-				data := chunk.GetBytes()
-				profile := &fsac.FileSystemAccessProfile{}
-				require.NoError(t, proto.Unmarshal(data, profile))
-				testutil.RequireEqualProto(t, &fsac.FileSystemAccessProfile{
-					BloomFilter:              []byte{0x80},
-					BloomFilterHashFunctions: 1,
-				}, profile)
-				return nil
-			})
+		protoPutter.EXPECT().PutProto(
+			gomock.Any(),
+			testutil.EqProto(t, &fsac.FileSystemAccessProfile{
+				BloomFilter:              []byte{0x80},
+				BloomFilterHashFunctions: 1,
+			}),
+			gomock.Any(),
+		).Return(accessProfileDigest, nil)
 		testutil.RequireEqualProto(
 			t,
 			&remoteexecution.ExecuteResponse{
@@ -598,9 +586,8 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 				BloomFilter:              []byte{0x80},
 				BloomFilterHashFunctions: 1,
 			}, nil)
-		accessProfileDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "dc1d3a7d5a534e6175cdc57c96cc031d", 5)
-		chunkStorage.EXPECT().Put(gomock.Any(), accessProfileDigest, gomock.Any()).
-			Return(status.Error(codes.Internal, "Storage offline"))
+		protoPutter.EXPECT().PutProto(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(digest.BadDigest, status.Error(codes.Internal, "Storage offline"))
 
 		testutil.RequireEqualProto(
 			t,
@@ -610,7 +597,7 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 						AuxiliaryMetadata: []*anypb.Any{defaultInputRootResourceUsage},
 					},
 				},
-				Status: status.New(codes.Internal, "Failed to store file system access profile to CAS: Failed to save chunk: Storage offline").Proto(),
+				Status: status.New(codes.Internal, "Failed to store file system access profile to CAS: Storage offline").Proto(),
 			},
 			profileLoggingBuildExecutor.Execute(
 				ctx,
@@ -646,8 +633,14 @@ func TestPrefetchingBuildExecutor(t *testing.T) {
 				BloomFilterHashFunctions: 1,
 			}, nil)
 		accessProfileDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "dc1d3a7d5a534e6175cdc57c96cc031d", 5)
-		chunkStorage.EXPECT().Put(gomock.Any(), accessProfileDigest, gomock.Any()).
-			Return(nil)
+		protoPutter.EXPECT().PutProto(
+			gomock.Any(),
+			testutil.EqProto(t, &fsac.FileSystemAccessProfile{
+				BloomFilter:              []byte{0x80},
+				BloomFilterHashFunctions: 1,
+			}),
+			gomock.Any(),
+		).Return(accessProfileDigest, nil)
 
 		testutil.RequireEqualProto(
 			t,
